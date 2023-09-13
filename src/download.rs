@@ -1,5 +1,5 @@
 use async_stream::try_stream;
-use futures::{pin_mut, StreamExt};
+use futures::StreamExt;
 use futures::{stream::FuturesUnordered, Stream};
 use librespot::protocol::keyexchange::ProductFlags;
 use librespot::{
@@ -61,8 +61,8 @@ impl DownloadClient {
 		})
 	}
 
-	/// Retain unfinished downloads from the download progress queue.
-	pub async fn retain_unfinished(&mut self) {
+	/// Remove finished downloads from the download progress queue.
+	pub async fn remove_finished(&mut self) {
 		let mut new_download_progress_queue = Vec::new();
 
 		// Filter out every download that is finished.

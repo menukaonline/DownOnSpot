@@ -54,7 +54,7 @@ impl From<ParseError> for DownOnSpotError {
 }
 
 impl From<ClientError> for DownOnSpotError {
-	fn from(e: ClientError) -> Self {
+	fn from(_e: ClientError) -> Self {
 		Self::Authentication
 	}
 }
