@@ -1,204 +1,97 @@
-#[macro_use]
-extern crate log;
+use std::env::var;
 
-mod converter;
-mod downloader;
+use args::Args;
+use clap::Parser;
+use dotenv::dotenv;
+use download::DownloadClient;
+use error::DownOnSpotError;
+use futures::{pin_mut, StreamExt};
+use librespot::core::spotify_id::SpotifyId;
+use librespot::discovery::Credentials;
+use simple_logger::SimpleLogger;
+use spotify::MetadataClient;
+
+use crate::spotify::SpotifyItem;
+mod args;
+mod convert;
+mod download;
 mod error;
-mod settings;
+mod format;
 mod spotify;
-mod tag;
 
-use async_std::task;
-use colored::Colorize;
-use downloader::{DownloadState, Downloader};
-use settings::Settings;
-use spotify::Spotify;
-use std::env;
-use std::time::{Duration, Instant};
-
-#[cfg(not(windows))]
-#[tokio::main]
-async fn main() {
-	start().await;
+fn setup_logging() -> Result<(), DownOnSpotError> {
+	SimpleLogger::new()
+		.with_level(log::LevelFilter::Off)
+		.with_module_level("down_on_spot", log::LevelFilter::Debug)
+		.init()
+		.map_err(|e| DownOnSpotError::Error(e.to_string()))
 }
 
-#[cfg(windows)]
-#[tokio::main]
-async fn main() {
-	use colored::control;
-
-	//backwards compatibility.
-	if control::set_virtual_terminal(true).is_ok() {};
-	start().await;
+fn setup_env() -> Result<(), DownOnSpotError> {
+	dotenv().map_err(|e| DownOnSpotError::Error(e.to_string()))?;
+	Ok(())
 }
 
-async fn start() {
-	let settings = match Settings::load().await {
-		Ok(settings) => {
-			println!(
-				"{} {}.",
-				"Settings successfully loaded.\nContinuing with spotify account:".green(),
-				settings.username
-			);
-			settings
-		}
-		Err(e) => {
-			println!(
-				"{} {}...",
-				"Settings could not be loaded, because of the following error:".red(),
-				e
-			);
-			let default_settings = Settings::new("username", "password", "client_id", "secret");
-			match default_settings.save().await {
-				Ok(_) => {
-					println!(
-						"{}",
-						"..but default settings have been created successfully. Edit them and run the program again.".green()
-					);
-				}
-				Err(e) => {
-					println!(
-						"{} {}",
-						"..and default settings could not be written:".red(),
-						e
-					);
-				}
-			};
-			return;
-		}
-	};
-
-	let args: Vec<String> = env::args().collect();
-	if args.len() <= 1 {
-		println!(
-			"Usage:\n{} <search_term> | <track_url> | <album_url> | <playlist_url> | <artist_url>",
-			args[0]
-		);
-		return;
+#[tokio::main]
+async fn main() {
+	if let Err(error) = run().await {
+		log::error!("{}", error);
 	}
+}
 
-	let spotify = match Spotify::new(
-		&settings.username,
-		&settings.password,
-		&settings.client_id,
-		&settings.client_secret,
-	)
-	.await
-	{
-		Ok(spotify) => {
-			println!("{}", "Login succeeded.".green());
-			spotify
-		}
-		Err(e) => {
-			println!(
-				"{} {}",
-				"Login failed, possibly due to invalid credentials or settings:".red(),
-				e
-			);
-			return;
-		}
-	};
+async fn run() -> Result<(), DownOnSpotError> {
+	setup_logging()?;
+	setup_env()?;
 
-	let input = args[1..].join(" ");
+	let args = Args::parse();
 
-	let downloader = Downloader::new(settings.downloader, spotify);
-	match downloader.handle_input(&input).await {
-		Ok(search_results) => {
-			if let Some(search_results) = search_results {
-				print!("{esc}[2J{esc}[1;1H", esc = 27 as char);
+	let (metadata_client, download_client) = futures::join!(
+		MetadataClient::new(rspotify::Credentials {
+			id: var("SPOTIFY_CLIENT_ID")
+				.expect("SPOTIFY_CLIENT_ID must be set.")
+				.into(),
+			secret: var("SPOTIFY_CLIENT_SECRET")
+				.expect("SPOTIFY_CLIENT_SECRET must be set.")
+				.into(),
+		}),
+		DownloadClient::new(Credentials::with_password(
+			var("SPOTIFY_USERNAME").expect("SPOTIFY_USERNAME must be set."),
+			var("SPOTIFY_PASSWORD").expect("SPOTIFY_PASSWORD must be set."),
+		))
+	);
+	let (download_client, metadata_client) = (download_client?, metadata_client?);
 
-				for (i, track) in search_results.iter().enumerate() {
-					println!("{}: {} - {}", i + 1, track.author, track.title);
+	let item = metadata_client.parse(&args.input).await?;
+
+	// TODO: Handle other types of items.
+	// TODO: Parallelize downloads.
+	if let SpotifyItem::Track(track) = item {
+		let id = &track.id.unwrap().to_string();
+		let id = SpotifyId::from_uri(id)?;
+
+		let download = download_client.download(id, args.strategy, &args.output, args.mp3);
+
+		pin_mut!(download);
+
+		while let Some(progress) = download.next().await {
+			print!("{esc}[2J{esc}[1;1H", esc = 27 as char);
+
+			match progress? {
+				download::DownloadProgress::Started => {
+					log::info!("Started download");
 				}
-				println!("{}", "Select the track (default: 1): ".green());
-
-				let mut selection;
-				loop {
-					let mut input = String::new();
-					std::io::stdin()
-						.read_line(&mut input)
-						.expect("Failed to read line");
-
-					selection = input.trim().parse::<usize>().unwrap_or(1) - 1;
-
-					if selection < search_results.len() {
-						break;
-					}
-					println!("{}", "Invalid selection. Try again or quit (CTRL+C):".red());
+				download::DownloadProgress::Finished => {
+					log::info!("Finished download");
 				}
-
-				let track = &search_results[selection];
-
-				if let Err(e) = downloader
-					.add_uri(&format!("spotify:track:{}", track.track_id))
-					.await
-				{
-					error!(
-						"{}",
-						format!(
-							"{}: {}",
-							"Track could not be added to download queue.".red(),
-							e
-						)
+				download::DownloadProgress::Progress(current, size) => {
+					log::info!(
+						"Download progress: {:.2}%",
+						(current as f64 / size as f64) * 100.0
 					);
-					return;
 				}
 			}
-
-			let refresh = Duration::from_secs(settings.refresh_ui_seconds);
-			let now = Instant::now();
-			let mut time_elapsed: u64;
-
-			'outer: loop {
-				print!("{esc}[2J{esc}[1;1H", esc = 27 as char);
-				let mut exit_flag: i8 = 1;
-
-				for download in downloader.get_downloads().await {
-					let state = download.state;
-
-					let progress: String;
-
-					if state != DownloadState::Done {
-						exit_flag &= 0;
-						progress = match state {
-							DownloadState::Downloading(r, t) => {
-								let p = r as f32 / t as f32 * 100.0;
-								if p > 100.0 {
-									"100%".to_string()
-								} else {
-									format!("{}%", p as i8)
-								}
-							}
-							DownloadState::Post => "Postprocessing... ".to_string(),
-							DownloadState::None => "Preparing... ".to_string(),
-							DownloadState::Lock => "Preparing... ".to_string(),
-							DownloadState::Error(e) => {
-								exit_flag |= 1;
-								format!("{} ", e)
-							}
-							DownloadState::Done => {
-								exit_flag |= 1;
-								"Impossible state".to_string()
-							}
-						};
-					} else {
-						progress = "Done.".to_string();
-					}
-
-					println!("{:<19}| {}", progress, download.title);
-				}
-				time_elapsed = now.elapsed().as_secs();
-				if exit_flag == 1 {
-					break 'outer;
-				}
-
-				println!("\nElapsed second(s): {}", time_elapsed);
-				task::sleep(refresh).await
-			}
-			println!("Finished download(s) in {} second(s).", time_elapsed);
-		}
-		Err(e) => {
-			error!("{} {}", "Handling input failed:".red(), e)
 		}
 	}
+
+	Ok(())
 }

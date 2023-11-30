@@ -1,215 +1,123 @@
-use aspotify::{
-	Album, Artist, Client, ClientCredentials, ItemType, Playlist, PlaylistItemType, Track,
-	TrackSimplified,
-};
-use librespot::core::authentication::Credentials;
-use librespot::core::cache::Cache;
-use librespot::core::config::SessionConfig;
-use librespot::core::session::Session;
-use std::fmt;
 use std::path::Path;
+
+use crate::error::DownOnSpotError;
+
+use rspotify::{
+	model::{
+		AlbumId, ArtistId, FullAlbum, FullArtist, FullPlaylist, FullTrack, PlaylistId, TrackId,
+	},
+	prelude::BaseClient,
+	ClientCredsSpotify, Credentials,
+};
 use url::Url;
 
-use crate::error::SpotifyError;
-
-pub struct Spotify {
-	// librespotify sessopm
-	pub session: Session,
-	pub spotify: Client,
+pub struct MetadataClient {
+	spotify: ClientCredsSpotify,
 }
 
-impl Spotify {
-	/// Create new instance
-	pub async fn new(
-		username: &str,
-		password: &str,
-		client_id: &str,
-		client_secret: &str,
-	) -> Result<Spotify, SpotifyError> {
-		// librespot
-		let credentials = Credentials::with_password(username, password);
-		let (session, _) = Session::connect(
-			SessionConfig::default(),
+pub enum SpotifyItem {
+	Track(FullTrack),
+	Album(FullAlbum),
+	Playlist(FullPlaylist),
+	Artist(FullArtist),
+}
+
+impl MetadataClient {
+	pub async fn new(credentials: Credentials) -> Result<MetadataClient, DownOnSpotError> {
+		let spotify = ClientCredsSpotify::with_config(
 			credentials,
-			Some(Cache::new(Some(Path::new("credentials_cache")), None, None, None).unwrap()),
-			true,
-		)
-		.await?;
+			rspotify::Config {
+				token_cached: true,
+				token_refreshing: true,
+				cache_path: Path::new("credentials_cache")
+					.join(rspotify::DEFAULT_CACHE_PATH)
+					.into(),
+				..Default::default()
+			},
+		);
 
-		//aspotify
-		let credentials = ClientCredentials {
-			id: client_id.to_string(),
-			secret: client_secret.to_string(),
-		};
-		let spotify = Client::new(credentials);
+		spotify.request_token().await?;
 
-		Ok(Spotify { session, spotify })
+		Ok(Self { spotify })
 	}
 
-	/// Parse URI or URL into URI
-	pub fn parse_uri(uri: &str) -> Result<String, SpotifyError> {
-		// Already URI
-		if uri.starts_with("spotify:") {
-			if uri.split(':').count() < 3 {
-				return Err(SpotifyError::InvalidUri);
-			}
-			return Ok(uri.to_string());
+	/// Get Spotify item from URL.
+	async fn from_url(&self, input: &str) -> Result<SpotifyItem, DownOnSpotError> {
+		let url = Url::parse(input)?;
+
+		let invalid_uri_error = || DownOnSpotError::Invalid("Invalid Spotify URL".to_owned());
+		let domain = url.domain().ok_or_else(invalid_uri_error)?;
+
+		if !domain.to_lowercase().ends_with("spotify.com") {
+			return Err(invalid_uri_error());
 		}
 
-		// Parse URL
-		let url = Url::parse(uri)?;
-		// Spotify Web Player URL
-		if url.host_str() == Some("open.spotify.com") {
-			let path = url
-				.path_segments()
-				.ok_or_else(|| SpotifyError::Error("Missing URL path".into()))?
-				.collect::<Vec<&str>>();
-			if path.len() < 2 {
-				return Err(SpotifyError::InvalidUri);
-			}
-			return Ok(format!("spotify:{}:{}", path[0], path[1]));
-		}
-		Err(SpotifyError::InvalidUri)
+		let mut segments = url.path_segments().ok_or_else(invalid_uri_error)?;
+		let item_type = segments
+			.next()
+			.ok_or_else(invalid_uri_error)?
+			.replace("/", "");
+		let spotify_id = segments.next_back().ok_or_else(invalid_uri_error)?;
+
+		self.from_id(&item_type, spotify_id).await
 	}
 
-	/// Fetch data for URI
-	pub async fn resolve_uri(&self, uri: &str) -> Result<SpotifyItem, SpotifyError> {
-		let parts = uri.split(':').skip(1).collect::<Vec<&str>>();
-		let id = parts[1];
-		match parts[0] {
+	/// Get Spotify item from ID.
+	async fn from_id(
+		&self,
+		item_type: &str,
+		spotify_id: &str,
+	) -> Result<SpotifyItem, DownOnSpotError> {
+		let spotify_item = match item_type {
 			"track" => {
-				let track = self.spotify.tracks().get_track(id, None).await?;
-				Ok(SpotifyItem::Track(track.data))
-			}
-			"playlist" => {
-				let playlist = self.spotify.playlists().get_playlist(id, None).await?;
-				Ok(SpotifyItem::Playlist(playlist.data))
+				let track_id = TrackId::from_id_or_uri(spotify_id)?;
+				let full_track = self.spotify.track(track_id).await?;
+
+				SpotifyItem::Track(full_track)
 			}
 			"album" => {
-				let album = self.spotify.albums().get_album(id, None).await?;
-				Ok(SpotifyItem::Album(album.data))
+				let album_id = AlbumId::from_id_or_uri(spotify_id)?;
+				let full_album = self.spotify.album(album_id).await?;
+
+				SpotifyItem::Album(full_album)
+			}
+			"playlist" => {
+				let playlist_id = PlaylistId::from_id_or_uri(spotify_id)?;
+				let full_playlist = self.spotify.playlist(playlist_id, None, None).await?;
+
+				SpotifyItem::Playlist(full_playlist)
 			}
 			"artist" => {
-				let artist = self.spotify.artists().get_artist(id).await?;
-				Ok(SpotifyItem::Artist(artist.data))
+				let artist_id = ArtistId::from_id_or_uri(spotify_id)?;
+				let full_artist = self.spotify.artist(artist_id).await?;
+
+				SpotifyItem::Artist(full_artist)
 			}
-			// Unsupported / Unimplemented
-			_ => Ok(SpotifyItem::Other(uri.to_string())),
+			_ => return Err(DownOnSpotError::InvalidId),
+		};
+
+		Ok(spotify_item)
+	}
+
+	pub async fn parse(&self, input: &str) -> Result<SpotifyItem, DownOnSpotError> {
+		let item = self.from_url(input).await;
+
+		// Try parsing as URL.
+		if item.is_ok() {
+			return item;
 		}
+
+		// Try parsing as Spotify ID.
+		let invalid_id = || DownOnSpotError::Invalid("Invalid Spotify URL or ID".to_string());
+
+		let mut splits = input
+			.strip_prefix("spotify:")
+			.ok_or_else(invalid_id)?
+			.split(":");
+
+		let item_type = splits.next().ok_or_else(invalid_id)?;
+		let spotify_id = splits.next().ok_or_else(invalid_id)?;
+
+		self.from_id(item_type, spotify_id).await
 	}
-
-	/// Get search results for query
-	pub async fn search(&self, query: &str) -> Result<Vec<Track>, SpotifyError> {
-		Ok(self
-			.spotify
-			.search()
-			.search(query, [ItemType::Track], true, 50, 0, None)
-			.await?
-			.data
-			.tracks
-			.unwrap()
-			.items)
-	}
-
-	/// Get all tracks from playlist
-	pub async fn full_playlist(&self, id: &str) -> Result<Vec<Track>, SpotifyError> {
-		let mut items = vec![];
-		let mut offset = 0;
-		loop {
-			let page = self
-				.spotify
-				.playlists()
-				.get_playlists_items(id, 100, offset, None)
-				.await?;
-			items.append(
-				&mut page
-					.data
-					.items
-					.iter()
-					.filter_map(|i| -> Option<Track> {
-						if let Some(PlaylistItemType::Track(t)) = &i.item {
-							Some(t.to_owned())
-						} else {
-							None
-						}
-					})
-					.collect(),
-			);
-
-			// End
-			offset += page.data.items.len();
-			if page.data.total == offset {
-				return Ok(items);
-			}
-		}
-	}
-
-	/// Get all tracks from album
-	pub async fn full_album(&self, id: &str) -> Result<Vec<TrackSimplified>, SpotifyError> {
-		let mut items = vec![];
-		let mut offset = 0;
-		loop {
-			let page = self
-				.spotify
-				.albums()
-				.get_album_tracks(id, 50, offset, None)
-				.await?;
-			items.append(&mut page.data.items.to_vec());
-
-			// End
-			offset += page.data.items.len();
-			if page.data.total == offset {
-				return Ok(items);
-			}
-		}
-	}
-
-	/// Get all tracks from artist
-	pub async fn full_artist(&self, id: &str) -> Result<Vec<TrackSimplified>, SpotifyError> {
-		let mut items = vec![];
-		let mut offset = 0;
-		loop {
-			let page = self
-				.spotify
-				.artists()
-				.get_artist_albums(id, None, 50, offset, None)
-				.await?;
-
-			for album in &mut page.data.items.iter() {
-				items.append(&mut self.full_album(&album.id).await?)
-			}
-
-			// End
-			offset += page.data.items.len();
-			if page.data.total == offset {
-				return Ok(items);
-			}
-		}
-	}
-}
-
-impl Clone for Spotify {
-	fn clone(&self) -> Self {
-		Self {
-			session: self.session.clone(),
-			spotify: Client::new(self.spotify.credentials.clone()),
-		}
-	}
-}
-
-/// Basic debug implementation so can be used in other structs
-impl fmt::Debug for Spotify {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "<Spotify Instance>")
-	}
-}
-
-#[derive(Debug, Clone)]
-pub enum SpotifyItem {
-	Track(Track),
-	Album(Album),
-	Playlist(Playlist),
-	Artist(Artist),
-	/// Unimplemented
-	Other(String),
 }
