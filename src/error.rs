@@ -5,8 +5,8 @@ use lame::EncodeError;
 use lewton::VorbisError;
 use librespot::{
 	core::{
-		audio_key::AudioKeyError, channel::ChannelError, session::SessionError,
-		spotify_id::SpotifyIdError,
+		audio_key::AudioKeyError, channel::ChannelError, mercury::MercuryError,
+		session::SessionError, spotify_id::SpotifyIdError,
 	},
 	discovery::Error,
 };
@@ -20,10 +20,11 @@ pub enum DownOnSpotError {
 	Authentication,
 	IoError(ErrorKind, String),
 	Unavailable,
-	InvalidId,
+	InvalidOrUnsupportedId,
 	DecoderError(String),
 	EncoderError(String),
 	Invalid(String),
+	DownloaderError,
 }
 
 impl fmt::Display for DownOnSpotError {
@@ -33,10 +34,11 @@ impl fmt::Display for DownOnSpotError {
 			DownOnSpotError::Authentication => write!(f, "Authentication error"),
 			DownOnSpotError::IoError(kind, e) => write!(f, "IO error: {:?} - {}", kind, e),
 			DownOnSpotError::Unavailable => write!(f, "Unavailable"),
-			DownOnSpotError::InvalidId => write!(f, "Invalid ID"),
+			DownOnSpotError::InvalidOrUnsupportedId => write!(f, "Invalid or unsupported ID"),
 			DownOnSpotError::DecoderError(e) => write!(f, "Decoder error: {}", e),
 			DownOnSpotError::EncoderError(e) => write!(f, "Encoder error: {}", e),
 			DownOnSpotError::Invalid(e) => write!(f, "Invalid: {}", e),
+			DownOnSpotError::DownloaderError => write!(f, "Error during download"),
 		}
 	}
 }
@@ -91,7 +93,7 @@ impl From<JoinError> for DownOnSpotError {
 
 impl From<SpotifyIdError> for DownOnSpotError {
 	fn from(_e: SpotifyIdError) -> Self {
-		Self::InvalidId
+		Self::InvalidOrUnsupportedId
 	}
 }
 
@@ -125,5 +127,11 @@ impl From<SessionError> for DownOnSpotError {
 impl From<Box<dyn std::error::Error>> for DownOnSpotError {
 	fn from(e: Box<dyn std::error::Error>) -> Self {
 		Self::Error(e.to_string())
+	}
+}
+
+impl From<MercuryError> for DownOnSpotError {
+	fn from(_: MercuryError) -> Self {
+		Self::DownloaderError
 	}
 }

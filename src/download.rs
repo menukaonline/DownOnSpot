@@ -1,29 +1,23 @@
 use async_stream::try_stream;
+
 use futures::StreamExt;
 use futures::{stream::FuturesUnordered, Stream};
-use librespot::protocol::keyexchange::ProductFlags;
+use librespot::metadata::Artist;
 use librespot::{
 	audio::{AudioDecrypt, AudioFile},
-	core::{
-		cache::Cache,
-		config::SessionConfig,
-		session::Session,
-		spotify_id::{FileId, SpotifyId},
-	},
-	discovery::Credentials,
+	core::{session::Session, spotify_id::FileId},
 	metadata::{FileFormat, Metadata, Track},
 };
 
 use std::io::ErrorKind;
-use std::pin::{self, Pin};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::{fs::File, future};
-use std::{
-	io::{Read, Seek, SeekFrom, Write},
-	path::Path,
-};
 
-use crate::{convert::Converter, format::Strategy};
-use crate::{error::DownOnSpotError, format::is_ogg};
+use crate::parse::DownloadableAudio;
+use crate::{audio_format::is_ogg, error::DownOnSpotError};
+use crate::{audio_format::DownloadOrderStrategy, convert::AudioConverter};
 
 pub struct DownloadClient {
 	session: Session,
@@ -40,25 +34,18 @@ pub struct DecryptedAudioFile {
 
 pub enum DownloadProgress {
 	Started,
-	Progress(usize, usize), // Current, Total
+	Progress { current: usize, total: usize },
 	Finished,
 }
 
 pub const SPOTIFY_OGG_HEADER_END: u64 = 0xA7;
 
 impl DownloadClient {
-	pub async fn new(credentials: Credentials) -> Result<DownloadClient, DownOnSpotError> {
-		let config = SessionConfig::default();
-		let credentials_cache = Path::new("credentials_cache");
-		let cache = Cache::new(credentials_cache.into(), None, None, None).unwrap();
-		let (session, _) = Session::connect(config, credentials, cache.into(), true).await?;
-
-		log::info!("Connected to Spotify");
-
-		Ok(Self {
-			session,
+	pub fn new(session: &Session) -> Self {
+		Self {
+			session: session.clone(),
 			download_progress_queue: vec![],
-		})
+		}
 	}
 
 	/// Remove finished downloads from the download progress queue.
@@ -79,17 +66,10 @@ impl DownloadClient {
 		self.download_progress_queue = new_download_progress_queue;
 	}
 
-	/// Get track from id.
-	async fn get_track(&self, id: SpotifyId) -> Result<Track, DownOnSpotError> {
-		self.find_available_track(id)
-			.await
-			.ok_or_else(|| DownOnSpotError::Unavailable)
-	}
-
 	/// Get file id for given track and strategy.
-	async fn get_file_id(
+	async fn file_id(
 		&self,
-		strategy: Strategy,
+		strategy: &DownloadOrderStrategy,
 		track: Track,
 	) -> Result<(FileId, FileFormat), DownOnSpotError> {
 		let formats = strategy.formats();
@@ -101,23 +81,23 @@ impl DownloadClient {
 
 				Some((*file_id, *format))
 			})
-			.ok_or_else(|| DownOnSpotError::Unavailable)
+			.ok_or(DownOnSpotError::Unavailable)
 	}
 
-	async fn decrypt(
+	async fn decrypt_stream(
 		&self,
-		strategy: Strategy,
+		strategy: &DownloadOrderStrategy,
 		track: Track,
 	) -> Result<DecryptedAudioFile, DownOnSpotError> {
 		let id = track.id;
-		let (file_id, format) = self.get_file_id(strategy, track).await?;
+		let (file_id, format) = self.file_id(strategy, track).await?;
 
 		let audio_file = AudioFile::open(&self.session, file_id, 1024 * 1024 * 1024, true).await?;
 		let size = audio_file.get_stream_loader_controller().len();
 		let key = self.session.audio_key().request(id, file_id).await?;
 
 		// Decrypt audio file.
-		let mut audio_decrypt = AudioDecrypt::new(key.into(), audio_file);
+		let mut audio_decrypt = AudioDecrypt::new(key, audio_file);
 
 		// OGG files have a header that needs to be skipped.
 		let is_ogg = is_ogg(format);
@@ -141,16 +121,19 @@ impl DownloadClient {
 	/// If mp3 is true, convert OGG to MP3.
 	async fn reader(
 		&self,
-		id: SpotifyId,
-		strategy: Strategy,
+		track: &Track,
+		strategy: &DownloadOrderStrategy,
 		mp3: bool,
 	) -> Result<(usize, Box<dyn Read>), DownOnSpotError> {
-		let track = self.get_track(id).await?;
+		let track = self
+			.available_track(track)
+			.await
+			.ok_or(DownOnSpotError::Unavailable)?;
 
-		let decrypted = self.decrypt(strategy, track).await?;
+		let decrypted = self.decrypt_stream(strategy, track).await?;
 
 		let reader: Box<dyn Read> = if decrypted.is_ogg && mp3 {
-			let converter = Converter::new(decrypted.audio_decrypt, decrypted.format.into())?;
+			let converter = AudioConverter::new(decrypted.audio_decrypt, decrypted.format.into())?;
 
 			Box::new(converter)
 		} else {
@@ -160,16 +143,40 @@ impl DownloadClient {
 		Ok((decrypted.size, reader))
 	}
 
-	pub fn download<'a>(
+	pub async fn download_audio<'a>(
 		&'a self,
-		id: SpotifyId,
-		strategy: Strategy,
-		output: &'a str,
+		downloadable_audio: &'a DownloadableAudio,
+		strategy: &'a DownloadOrderStrategy,
+		output_directory: &'a str,
+		mp3: bool,
+	) -> impl Stream<Item = Result<DownloadProgress, DownOnSpotError>> + 'a {
+		match downloadable_audio {
+			DownloadableAudio::Track(track) => {
+				self.download(track, strategy, output_directory, mp3)
+			}
+			DownloadableAudio::Album(_) | DownloadableAudio::Playlist(_) => todo!(),
+			DownloadableAudio::Show(_) => todo!(), // List of episodes.
+			DownloadableAudio::Episode(_episode) => todo!(), // Annoyingly, episodes are not tracks.
+		}
+	}
+
+	fn download<'a>(
+		&'a self,
+		track: &'a Track,
+		strategy: &'a DownloadOrderStrategy,
+		output_directory: &'a str,
 		mp3: bool,
 	) -> impl Stream<Item = Result<DownloadProgress, DownOnSpotError>> + 'a {
 		try_stream! {
 			yield DownloadProgress::Started;
-			let (size, mut reader) = self.reader(id, strategy, mp3).await?;
+
+			// TODO: Move this to somewhere else.
+			let track_name = &track.name;
+			let track_artist = Artist::get(&self.session, *track.artists.first().unwrap()).await?.name;
+
+			// Actual downloader logic.
+
+			let (size, mut reader) = self.reader(track, strategy, mp3).await?;
 
 			let mut file: Vec<u8> = vec![];
 
@@ -186,7 +193,7 @@ impl DownloadClient {
 						file.extend_from_slice(&buffer[..bytes_read]);
 
 						current += bytes_read;
-						yield DownloadProgress::Progress(current, size);
+						yield DownloadProgress::Progress{current, total:size};
 					}
 					Err(e) => {
 						if e.kind() == ErrorKind::Interrupted {
@@ -198,22 +205,32 @@ impl DownloadClient {
 				}
 			}
 
-			// Write audio file.
-			File::create(output)?.write_all(&file)?;
+			let mut path = PathBuf::from(output_directory);
 
+			// TODO: Move this to somewhere else.
+			let file_name = if mp3 {
+				format!("{} - {}.mp3", track_artist, track_name)
+			} else {
+				format!("{} - {}.ogg", track_artist, track_name)
+			};
+
+			path.push(file_name);
+
+			// Write audio file.
+			File::create(path)?.write_all(&file)?;
 		}
 	}
 
 	/// Find available track.
 	/// If not found, fallback to alternative tracks.
-	async fn find_available_track(&self, spotify_id: SpotifyId) -> Option<Track> {
-		let track = Track::get(&self.session, spotify_id).await.ok()?;
-
+	async fn available_track(&self, track: &Track) -> Option<Track> {
 		if !track.files.is_empty() {
-			return Some(track);
+			return Some(track.to_owned());
 		}
 
-		let alternative = track
+		
+
+		track
 			.alternatives
 			.iter()
 			.map(|alt_id| Track::get(&self.session, *alt_id))
@@ -221,8 +238,6 @@ impl DownloadClient {
 			.filter_map(|x| future::ready(x.ok()))
 			.filter(|x| future::ready(x.available))
 			.next()
-			.await;
-
-		alternative
+			.await
 	}
 }

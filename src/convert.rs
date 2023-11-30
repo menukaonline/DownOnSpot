@@ -6,19 +6,19 @@ use librespot::metadata::FileFormat;
 
 use crate::error::DownOnSpotError;
 
-pub struct Converter<T: Read + Seek> {
+pub struct AudioConverter<T: Read + Seek> {
 	decoder: OggStreamReader<T>,
 	encoder: Lame,
 }
 
 #[derive(Clone)]
-pub enum Bitrate {
+pub enum AudioBitrate {
 	Q320,
 	Q160,
 	Q96,
 }
 
-impl Bitrate {
+impl AudioBitrate {
 	/// Set bitrate for given encoder.
 	pub fn set_for_encoder(&self, encoder: &mut Lame) -> Result<(), DownOnSpotError> {
 		encoder.set_kilobitrate(self.into())?;
@@ -29,8 +29,8 @@ impl Bitrate {
 }
 
 // TODO: Fix this.
-impl<T: Read + Seek> Converter<T> {
-	pub fn new(inner: T, bitrate: Bitrate) -> Result<Self, DownOnSpotError> {
+impl<T: Read + Seek> AudioConverter<T> {
+	pub fn new(inner: T, bitrate: AudioBitrate) -> Result<Self, DownOnSpotError> {
 		let decoder = OggStreamReader::new(inner)?;
 		let mut encoder = Lame::new()
 			.ok_or_else(|| DownOnSpotError::EncoderError("Failed to create encoder".to_owned()))?;
@@ -43,7 +43,7 @@ impl<T: Read + Seek> Converter<T> {
 	}
 }
 
-impl<T: Read + Seek> Converter<T> {
+impl<T: Read + Seek> AudioConverter<T> {
 	/// Read data from decoder and encode it with encoder.
 	fn read_encoded(&mut self, buf: &mut [u8]) -> Result<usize, DownOnSpotError> {
 		let Some(data) = self.decoder.read_dec_packet()? else {
@@ -68,40 +68,40 @@ impl<T: Read + Seek> Converter<T> {
 	}
 }
 
-impl<T: Read + Seek> Read for Converter<T> {
+impl<T: Read + Seek> Read for AudioConverter<T> {
 	fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
 		self.read_encoded(buf)
 			.map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
 	}
 }
 
-impl Into<Bitrate> for FileFormat {
-	fn into(self) -> Bitrate {
-		match self {
-			FileFormat::OGG_VORBIS_320 => Bitrate::Q320,
-			FileFormat::OGG_VORBIS_160 => Bitrate::Q160,
-			FileFormat::OGG_VORBIS_96 => Bitrate::Q96,
-			_ => Bitrate::Q320,
+impl From<FileFormat> for AudioBitrate {
+	fn from(val: FileFormat) -> Self {
+		match val {
+			FileFormat::OGG_VORBIS_320 => AudioBitrate::Q320,
+			FileFormat::OGG_VORBIS_160 => AudioBitrate::Q160,
+			FileFormat::OGG_VORBIS_96 => AudioBitrate::Q96,
+			_ => AudioBitrate::Q320,
 		}
 	}
 }
 
-impl Into<i32> for &Bitrate {
-	fn into(self) -> i32 {
-		match self {
-			Bitrate::Q320 => 320,
-			Bitrate::Q160 => 160,
-			Bitrate::Q96 => 96,
+impl From<&AudioBitrate> for i32 {
+	fn from(val: &AudioBitrate) -> Self {
+		match val {
+			AudioBitrate::Q320 => 320,
+			AudioBitrate::Q160 => 160,
+			AudioBitrate::Q96 => 96,
 		}
 	}
 }
 
-impl Into<u8> for &Bitrate {
-	fn into(self) -> u8 {
-		match self {
-			Bitrate::Q320 => 0,
-			Bitrate::Q160 => 2,
-			Bitrate::Q96 => 5,
+impl From<&AudioBitrate> for u8 {
+	fn from(val: &AudioBitrate) -> Self {
+		match val {
+			AudioBitrate::Q320 => 0,
+			AudioBitrate::Q160 => 2,
+			AudioBitrate::Q96 => 5,
 		}
 	}
 }
